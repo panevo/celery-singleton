@@ -146,6 +146,21 @@ class Singleton(BaseTask):
             )
         return self.AsyncResult(existing_task_id)
 
+    def retry(self, args=None, kwargs=None, exc=None, throw=True,
+             eta=None, countdown=None, max_retries=None, **options):
+        # Release the lock using the current request's args/kwargs so the
+        # retry (which goes through apply_async) can acquire a fresh lock
+        # instead of being treated as a duplicate.
+        request = self.request
+        self.release_lock(
+            task_args=request.args,
+            task_kwargs=request.kwargs,
+        )
+        return super().retry(
+            args=args, kwargs=kwargs, exc=exc, throw=throw,
+            eta=eta, countdown=countdown, max_retries=max_retries, **options
+        )
+
     def on_failure(self, exc, task_id, args, kwargs, einfo):
         self.release_lock(task_args=args, task_kwargs=kwargs)
 

@@ -149,6 +149,78 @@ class TestSimpleTask:
             with pytest.raises(ExpectedTaskFail):
                 simple_task.apply_async(args=[1, 2, 3])
 
+    def test__retry_releases_lock(self, scoped_app):
+        """When a task calls self.retry(), the lock should be released so the
+        retry (which goes through apply_async) is not treated as a duplicate."""
+        with scoped_app as app:
+
+            @app.task(base=Singleton, bind=True, max_retries=1)
+            def retrying_task(self, *args):
+                return args
+
+            task_args = [1, 2, 3]
+            lock = retrying_task.generate_lock(retrying_task.name, task_args=task_args)
+
+            # Simulate the lock being held (as if the task is currently running)
+            retrying_task.aquire_lock(lock, "original_task_id")
+            assert retrying_task.get_existing_task_id(lock) == "original_task_id"
+
+            # Patch release_lock to track calls and still execute normally,
+            # and patch BaseTask.retry to prevent actual dispatch.
+            with mock.patch.object(
+                retrying_task, "release_lock", wraps=retrying_task.release_lock
+            ) as mock_release:
+                with mock.patch.object(BaseTask, "retry"):
+                    # Push a fake request context so self.request.args/kwargs
+                    # are available during retry()
+                    retrying_task.push_request(args=task_args, kwargs={})
+                    try:
+                        retrying_task.retry()
+                    finally:
+                        retrying_task.pop_request()
+
+            # release_lock should have been called with the request args/kwargs
+            mock_release.assert_called_once_with(
+                task_args=task_args, task_kwargs={},
+            )
+            # The lock should have been released
+            assert retrying_task.get_existing_task_id(lock) is None
+
+    def test__retry_releases_lock_before_requeue(self, scoped_app):
+        """Verify that retry releases the lock before calling super().retry()."""
+        with scoped_app as app:
+
+            @app.task(base=Singleton, bind=True, max_retries=1)
+            def retrying_task(self, *args):
+                return args
+
+            task_args = [1, 2, 3]
+            lock = retrying_task.generate_lock(retrying_task.name, task_args=task_args)
+
+            # Simulate the lock being held
+            retrying_task.aquire_lock(lock, "original_task_id")
+
+            call_order = []
+            original_release = retrying_task.release_lock
+
+            def tracking_release(*a, **kw):
+                call_order.append("release_lock")
+                return original_release(*a, **kw)
+
+            def tracking_retry(*a, **kw):
+                call_order.append("retry")
+
+            with mock.patch.object(retrying_task, "release_lock", side_effect=tracking_release):
+                with mock.patch.object(BaseTask, "retry", side_effect=tracking_retry):
+                    retrying_task.push_request(args=task_args, kwargs={})
+                    try:
+                        retrying_task.retry()
+                    finally:
+                        retrying_task.pop_request()
+
+            # release_lock must happen before retry
+            assert call_order == ["release_lock", "retry"]
+
     def test__raise_on_duplicate__raises_duplicate_error(self, scoped_app):
         with scoped_app as app:
 
