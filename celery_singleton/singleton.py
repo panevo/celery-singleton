@@ -117,10 +117,12 @@ class Singleton(BaseTask):
             if task:
                 return task
             existing_task_id = self.get_existing_task_id(lock)
-        if existing_task_id == task_id:
-            # The lock is held by this same task ID, e.g. when the running
-            # task calls self.retry(), so it is not a duplicate
-            return self.run_locked(**run_args)
+        if existing_task_id == task_id == self.request.id:
+            # The running task is re-queuing itself (e.g. self.retry()) and
+            # already holds the lock, so hand the lock over to the new message
+            task = self.run_locked(**run_args)
+            self.request.singleton_requeued = True
+            return task
         return self.on_duplicate(existing_task_id)
 
     def lock_and_run(self, lock, *args, task_id=None, **kwargs):
@@ -154,7 +156,9 @@ class Singleton(BaseTask):
         return self.AsyncResult(existing_task_id)
 
     def on_failure(self, exc, task_id, args, kwargs, einfo):
-        self.release_lock(task_args=args, task_kwargs=kwargs)
+        if not getattr(self.request, "singleton_requeued", False):
+            self.release_lock(task_args=args, task_kwargs=kwargs)
 
     def on_success(self, retval, task_id, args, kwargs):
-        self.release_lock(task_args=args, task_kwargs=kwargs)
+        if not getattr(self.request, "singleton_requeued", False):
+            self.release_lock(task_args=args, task_kwargs=kwargs)

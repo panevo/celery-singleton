@@ -43,6 +43,13 @@ class ExpectedTaskFail(Exception):
     pass
 
 
+def wait_for(condition, timeout=10):
+    deadline = time.time() + timeout
+    while not condition():
+        assert time.time() < deadline, "Timed out waiting for condition"
+        time.sleep(0.05)
+
+
 class TestSimpleTask:
     def test__queue_duplicates__same_id(self, scoped_app):
         with scoped_app as app:
@@ -187,8 +194,80 @@ class TestSimpleTask:
             lock = retrying_task.generate_lock(retrying_task.name, task_args=[1, 2, 3])
             assert retrying_task.get_existing_task_id(lock) is None
 
+    def test__retry__duplicate_blocked_while_retry_pending(
+        self, scoped_app, celery_worker
+    ):
+        with scoped_app as app:
+            redis = get_backend(Config(app)).redis
+
+            @celery_worker.app.task(base=Singleton, bind=True, max_retries=1)
+            def retrying_task(self, *args):
+                if self.request.retries == 0:
+                    redis.incr("first_run_done")
+                    raise self.retry(countdown=2)
+                return self.request.retries
+
+            celery_worker.reload()
+
+            task = retrying_task.apply_async(args=[1, 2, 3])
+            wait_for(lambda: redis.get("first_run_done"))
+            time.sleep(0.05)  # small delay for on_retry
+
+            assert retrying_task.apply_async(args=[1, 2, 3]) == task
+            assert task.get(timeout=10) == 1
+
+    def test__retry_without_throw__lock_kept_for_retry(
+        self, scoped_app, celery_worker
+    ):
+        with scoped_app as app:
+            redis = get_backend(Config(app)).redis
+
+            @celery_worker.app.task(base=Singleton, bind=True, max_retries=1)
+            def retrying_task(self, *args):
+                if self.request.retries == 0:
+                    self.retry(countdown=2, throw=False)
+                    redis.incr("first_run_done")
+                    return "first"
+                redis.incr("retry_done")
+                return "retried"
+
+            celery_worker.reload()
+
+            task = retrying_task.apply_async(args=[1, 2, 3])
+            wait_for(lambda: redis.get("first_run_done"))
+            time.sleep(0.05)  # small delay for on_success
+
+            lock = retrying_task.generate_lock(retrying_task.name, task_args=[1, 2, 3])
+            assert retrying_task.get_existing_task_id(lock) == task.id
+            assert retrying_task.apply_async(args=[1, 2, 3]) == task
+
+            wait_for(lambda: redis.get("retry_done"))
+            time.sleep(0.05)  # small delay for on_success
+            assert retrying_task.get_existing_task_id(lock) is None
+
+    def test__retry__eager__task_runs_again_and_lock_released(self, scoped_app):
+        with scoped_app as app:
+            app.conf.task_always_eager = True
+            try:
+
+                @app.task(base=Singleton, bind=True, max_retries=1)
+                def retrying_task(self, *args):
+                    if self.request.retries == 0:
+                        raise self.retry(countdown=0)
+                    return self.request.retries
+
+                task = retrying_task.apply_async(args=[1, 2, 3])
+                assert task.get() == 1
+
+                lock = retrying_task.generate_lock(
+                    retrying_task.name, task_args=[1, 2, 3]
+                )
+                assert retrying_task.get_existing_task_id(lock) is None
+            finally:
+                app.conf.task_always_eager = False
+
     @mock.patch.object(BaseTask, "apply_async")
-    def test__queue_with_lock_owner_task_id__lock_kept(self, mock_base, scoped_app):
+    def test__queue_with_lock_owner_task_id__duplicate(self, mock_base, scoped_app):
         with scoped_app as app:
 
             @app.task(base=Singleton)
@@ -199,7 +278,29 @@ class TestSimpleTask:
             lock = simple_task.generate_lock(simple_task.name, task_args=task_args)
             simple_task.aquire_lock(lock, "original_task_id")
 
-            simple_task.apply_async(args=task_args, task_id="original_task_id")
+            task = simple_task.apply_async(args=task_args, task_id="original_task_id")
+
+            mock_base.assert_not_called()
+            assert task.id == "original_task_id"
+
+    @mock.patch.object(BaseTask, "apply_async")
+    def test__requeue_from_running_task__lock_kept(self, mock_base, scoped_app):
+        with scoped_app as app:
+
+            @app.task(base=Singleton)
+            def simple_task(*args):
+                return args
+
+            task_args = [1, 2, 3]
+            lock = simple_task.generate_lock(simple_task.name, task_args=task_args)
+            simple_task.aquire_lock(lock, "original_task_id")
+
+            simple_task.push_request(id="original_task_id", args=task_args)
+            try:
+                simple_task.apply_async(args=task_args, task_id="original_task_id")
+                assert simple_task.request.singleton_requeued
+            finally:
+                simple_task.pop_request()
 
             mock_base.assert_called_once()
             assert mock_base.call_args.kwargs["task_id"] == "original_task_id"
@@ -208,7 +309,7 @@ class TestSimpleTask:
     @mock.patch.object(
         BaseTask, "apply_async", side_effect=Exception("Apply async error")
     )
-    def test__queue_with_lock_owner_task_id__apply_async_fails__lock_cleared(
+    def test__requeue_from_running_task__apply_async_fails__lock_cleared(
         self, mock_base, scoped_app
     ):
         with scoped_app as app:
@@ -221,8 +322,12 @@ class TestSimpleTask:
             lock = simple_task.generate_lock(simple_task.name, task_args=task_args)
             simple_task.aquire_lock(lock, "original_task_id")
 
-            with pytest.raises(Exception):
-                simple_task.apply_async(args=task_args, task_id="original_task_id")
+            simple_task.push_request(id="original_task_id", args=task_args)
+            try:
+                with pytest.raises(Exception):
+                    simple_task.apply_async(args=task_args, task_id="original_task_id")
+            finally:
+                simple_task.pop_request()
             assert simple_task.get_existing_task_id(lock) is None
 
     def test__raise_on_duplicate__raises_duplicate_error(self, scoped_app):

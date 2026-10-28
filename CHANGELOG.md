@@ -21,7 +21,7 @@ The first release of this fork, published to PyPI as `celery-singleton-reboot`. 
 
 ### Fixed
 - Calling `self.retry()` from a singleton task no longer treats the retry as a duplicate of itself.
-  `apply_async()` now dispatches when the lock is already held by the same task ID, so the lock stays held across retries.
+  When the running task re-queues itself under its own task ID, `apply_async()` dispatches it and hands over the lock, which stays held (subject to `lock_expiry`) until the retry finishes.
 
 ## [0.3.1] - 2021-01-14
 
