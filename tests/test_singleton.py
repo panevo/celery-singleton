@@ -242,8 +242,33 @@ class TestSimpleTask:
             assert retrying_task.apply_async(args=[1, 2, 3]) == task
 
             wait_for(lambda: redis.get("retry_done"))
+            wait_for(lambda: retrying_task.get_existing_task_id(lock) is None)
+
+    def test__retry_without_throw__lock_expired__new_lock_kept_for_retry(
+        self, scoped_app, celery_worker
+    ):
+        with scoped_app as app:
+            redis = get_backend(Config(app)).redis
+
+            @celery_worker.app.task(
+                base=Singleton, bind=True, max_retries=1, lock_expiry=1
+            )
+            def retrying_task(self, *args):
+                if self.request.retries == 0:
+                    time.sleep(1.3)  # let the lock expire
+                    self.retry(countdown=3, throw=False)
+                    redis.incr("first_run_done")
+                    return "first"
+                return "retried"
+
+            celery_worker.reload()
+
+            task = retrying_task.apply_async(args=[1, 2, 3])
+            wait_for(lambda: redis.get("first_run_done"))
             time.sleep(0.05)  # small delay for on_success
-            assert retrying_task.get_existing_task_id(lock) is None
+
+            lock = retrying_task.generate_lock(retrying_task.name, task_args=[1, 2, 3])
+            assert retrying_task.get_existing_task_id(lock) == task.id
 
     def test__retry__eager__task_runs_again_and_lock_released(self, scoped_app):
         with scoped_app as app:
