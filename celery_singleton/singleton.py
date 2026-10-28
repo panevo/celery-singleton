@@ -117,19 +117,26 @@ class Singleton(BaseTask):
             if task:
                 return task
             existing_task_id = self.get_existing_task_id(lock)
+        if existing_task_id == task_id:
+            # The lock is held by this same task ID, e.g. when the running
+            # task calls self.retry(), so it is not a duplicate
+            return self.run_locked(**run_args)
         return self.on_duplicate(existing_task_id)
 
     def lock_and_run(self, lock, *args, task_id=None, **kwargs):
         lock_aquired = self.aquire_lock(lock, task_id)
         if lock_aquired:
-            try:
-                return super(Singleton, self).apply_async(
-                    *args, task_id=task_id, **kwargs
-                )
-            except Exception:
-                # Clear the lock if apply_async fails
-                self.unlock(lock)
-                raise
+            return self.run_locked(lock, *args, task_id=task_id, **kwargs)
+
+    def run_locked(self, lock, *args, task_id=None, **kwargs):
+        try:
+            return super(Singleton, self).apply_async(
+                *args, task_id=task_id, **kwargs
+            )
+        except Exception:
+            # Clear the lock if apply_async fails
+            self.unlock(lock)
+            raise
 
     def release_lock(self, task_args=None, task_kwargs=None):
         lock = self.generate_lock(self.name, task_args, task_kwargs)
@@ -145,21 +152,6 @@ class Singleton(BaseTask):
                 task_id=existing_task_id,
             )
         return self.AsyncResult(existing_task_id)
-
-    def retry(self, args=None, kwargs=None, exc=None, throw=True,
-             eta=None, countdown=None, max_retries=None, **options):
-        # Release the lock using the current request's args/kwargs so the
-        # retry (which goes through apply_async) can acquire a fresh lock
-        # instead of being treated as a duplicate.
-        request = self.request
-        self.release_lock(
-            task_args=request.args,
-            task_kwargs=request.kwargs,
-        )
-        return super().retry(
-            args=args, kwargs=kwargs, exc=exc, throw=throw,
-            eta=eta, countdown=countdown, max_retries=max_retries, **options
-        )
 
     def on_failure(self, exc, task_id, args, kwargs, einfo):
         self.release_lock(task_args=args, task_kwargs=kwargs)

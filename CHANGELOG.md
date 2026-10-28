@@ -19,6 +19,10 @@ The first release of this fork, published to PyPI as `celery-singleton-reboot`. 
 - Publish releases to PyPI with trusted publishing.
 - Build the package with `poetry-core` instead of the whole of Poetry.
 
+### Fixed
+- Calling `self.retry()` from a singleton task no longer treats the retry as a duplicate of itself.
+  `apply_async()` now dispatches when the lock is already held by the same task ID, so the lock stays held across retries.
+
 ## [0.3.1] - 2021-01-14
 
 ### Changed
