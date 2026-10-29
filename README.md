@@ -84,7 +84,7 @@ c = do_stuff.delay(4, 5, 6)
 assert a != c  # c has different arguments so it spawns a new task
 ```
 
-The lock is released only when the task has finished running, using either the `on_success` or `on_failure` handler, after which you're free to start another identical run.
+The lock is released only when the task has finished running, using either the `on_success` or `on_failure` handler, after which you're free to start another identical run. If the task is revoked, or expires before it runs, the lock is released when the worker discards it.
 
 ```python
 # wait for a to finish
@@ -99,7 +99,7 @@ assert a != d
 
 ## Handling deadlocks
 Since the task locks are only released when the task is actually finished running (on success or on failure), you can sometimes end up in a situation where the lock remains but there's no task available to release it.
-This can for example happen if your celery worker crashes before it can release the lock.
+This can for example happen if your celery worker crashes before it can release the lock, or if a queued task never reaches a worker, for example because its queue was purged.
 
 A convenience method is included to clear all existing locks, you can run it on celery worker startup or any other celery signal like so:
 

@@ -8,6 +8,8 @@ import random
 import uuid
 from celery import Celery
 from celery import Task as BaseTask
+from celery.app.task import Context
+from celery.signals import task_postrun, task_revoked
 from celery_singleton.singleton import Singleton, clear_locks
 from celery_singleton import util, DuplicateTaskError
 from celery_singleton.backends.redis import RedisBackend
@@ -41,6 +43,21 @@ def scoped_app(celery_app):
 
 class ExpectedTaskFail(Exception):
     pass
+
+
+@pytest.fixture
+def finished_runs():
+    """IDs of tasks whose run has finished, including on_success and on_failure"""
+    task_ids = []
+
+    def on_postrun(task_id=None, **kwargs):
+        task_ids.append(task_id)
+
+    task_postrun.connect(on_postrun, weak=False)
+    try:
+        yield task_ids
+    finally:
+        task_postrun.disconnect(on_postrun)
 
 
 def wait_for(condition, timeout=10):
@@ -156,7 +173,9 @@ class TestSimpleTask:
             with pytest.raises(ExpectedTaskFail):
                 simple_task.apply_async(args=[1, 2, 3])
 
-    def test__retry__task_is_requeued_and_runs_again(self, scoped_app, celery_worker):
+    def test__retry__task_is_requeued_and_runs_again(
+        self, scoped_app, celery_worker, finished_runs
+    ):
         with scoped_app:
 
             @celery_worker.app.task(base=Singleton, bind=True, max_retries=1)
@@ -169,13 +188,13 @@ class TestSimpleTask:
 
             task = retrying_task.apply_async(args=[1, 2, 3])
             assert task.get(timeout=10) == 1
-            time.sleep(0.05)  # small delay for on_success
+            wait_for(lambda: len(finished_runs) == 2)
 
             lock = retrying_task.generate_lock(retrying_task.name, task_args=[1, 2, 3])
             assert retrying_task.get_existing_task_id(lock) is None
 
     def test__retry__max_retries_exceeded__lock_released(
-        self, scoped_app, celery_worker
+        self, scoped_app, celery_worker, finished_runs
     ):
         with scoped_app:
 
@@ -189,66 +208,85 @@ class TestSimpleTask:
             with pytest.raises(Exception) as excinfo:
                 task.get(timeout=10)
             assert type(excinfo.value).__name__ == ExpectedTaskFail.__name__
-            time.sleep(0.05)  # small delay for on_failure
+            wait_for(lambda: len(finished_runs) == 2)
 
             lock = retrying_task.generate_lock(retrying_task.name, task_args=[1, 2, 3])
             assert retrying_task.get_existing_task_id(lock) is None
 
     def test__retry__duplicate_blocked_while_retry_pending(
-        self, scoped_app, celery_worker
+        self, scoped_app, celery_worker, finished_runs
     ):
-        with scoped_app as app:
-            redis = get_backend(Config(app)).redis
+        with scoped_app:
 
             @celery_worker.app.task(base=Singleton, bind=True, max_retries=1)
             def retrying_task(self, *args):
                 if self.request.retries == 0:
-                    redis.incr("first_run_done")
                     raise self.retry(countdown=2)
                 return self.request.retries
 
             celery_worker.reload()
 
             task = retrying_task.apply_async(args=[1, 2, 3])
-            wait_for(lambda: redis.get("first_run_done"))
-            time.sleep(0.05)  # small delay for on_retry
+            wait_for(lambda: len(finished_runs) == 1)
 
             assert retrying_task.apply_async(args=[1, 2, 3]) == task
             assert task.get(timeout=10) == 1
 
-    def test__retry_without_throw__lock_kept_for_retry(
-        self, scoped_app, celery_worker
+    def test__retry_twice_in_one_run__queued_once(
+        self, scoped_app, celery_worker, finished_runs
     ):
-        with scoped_app as app:
-            redis = get_backend(Config(app)).redis
+        with scoped_app:
+
+            @celery_worker.app.task(base=Singleton, bind=True, max_retries=2)
+            def retrying_task(self, *args):
+                if self.request.retries == 0:
+                    try:
+                        self.retry(countdown=0)
+                    except Exception as e:
+                        # Retry is an Exception, so this retries a second time
+                        raise self.retry(exc=e, countdown=1)
+                return self.request.retries
+
+            celery_worker.reload()
+
+            task = retrying_task.apply_async(args=[1, 2, 3])
+            assert task.get(timeout=10) == 1
+            wait_for(lambda: len(finished_runs) == 2)
+
+            lock = retrying_task.generate_lock(retrying_task.name, task_args=[1, 2, 3])
+            assert retrying_task.get_existing_task_id(lock) is None
+
+            time.sleep(1.5)  # past the second retry's countdown
+            assert len(finished_runs) == 2
+
+    def test__retry_without_throw__lock_kept_for_retry(
+        self, scoped_app, celery_worker, finished_runs
+    ):
+        with scoped_app:
 
             @celery_worker.app.task(base=Singleton, bind=True, max_retries=1)
             def retrying_task(self, *args):
                 if self.request.retries == 0:
                     self.retry(countdown=2, throw=False)
-                    redis.incr("first_run_done")
                     return "first"
-                redis.incr("retry_done")
                 return "retried"
 
             celery_worker.reload()
 
             task = retrying_task.apply_async(args=[1, 2, 3])
-            wait_for(lambda: redis.get("first_run_done"))
-            time.sleep(0.05)  # small delay for on_success
+            wait_for(lambda: len(finished_runs) == 1)
 
             lock = retrying_task.generate_lock(retrying_task.name, task_args=[1, 2, 3])
             assert retrying_task.get_existing_task_id(lock) == task.id
             assert retrying_task.apply_async(args=[1, 2, 3]) == task
 
-            wait_for(lambda: redis.get("retry_done"))
-            wait_for(lambda: retrying_task.get_existing_task_id(lock) is None)
+            wait_for(lambda: len(finished_runs) == 2)
+            assert retrying_task.get_existing_task_id(lock) is None
 
     def test__retry_without_throw__lock_expired__new_lock_kept_for_retry(
-        self, scoped_app, celery_worker
+        self, scoped_app, celery_worker, finished_runs
     ):
-        with scoped_app as app:
-            redis = get_backend(Config(app)).redis
+        with scoped_app:
 
             @celery_worker.app.task(
                 base=Singleton, bind=True, max_retries=1, lock_expiry=1
@@ -257,18 +295,64 @@ class TestSimpleTask:
                 if self.request.retries == 0:
                     time.sleep(1.3)  # let the lock expire
                     self.retry(countdown=3, throw=False)
-                    redis.incr("first_run_done")
                     return "first"
                 return "retried"
 
             celery_worker.reload()
 
             task = retrying_task.apply_async(args=[1, 2, 3])
-            wait_for(lambda: redis.get("first_run_done"))
-            time.sleep(0.05)  # small delay for on_success
+            wait_for(lambda: len(finished_runs) == 1)
 
             lock = retrying_task.generate_lock(retrying_task.name, task_args=[1, 2, 3])
             assert retrying_task.get_existing_task_id(lock) == task.id
+
+    def test__retry_without_throw__retry_expires__lock_released(
+        self, scoped_app, celery_worker, finished_runs
+    ):
+        with scoped_app:
+
+            @celery_worker.app.task(base=Singleton, bind=True, max_retries=1)
+            def retrying_task(self, *args):
+                if self.request.retries == 0:
+                    # The retry keeps the original expires, so it is discarded
+                    self.retry(countdown=4, throw=False)
+                    return "first"
+                return "retried"
+
+            celery_worker.reload()
+
+            task = retrying_task.apply_async(args=[1, 2, 3], expires=2)
+            wait_for(lambda: len(finished_runs) == 1)
+
+            lock = retrying_task.generate_lock(retrying_task.name, task_args=[1, 2, 3])
+            assert retrying_task.get_existing_task_id(lock) == task.id
+
+            wait_for(lambda: retrying_task.get_existing_task_id(lock) is None)
+            assert len(finished_runs) == 1
+
+    def test__retry_without_throw__retry_revoked__lock_released(
+        self, scoped_app, celery_worker, finished_runs
+    ):
+        with scoped_app:
+
+            @celery_worker.app.task(base=Singleton, bind=True, max_retries=1)
+            def retrying_task(self, *args):
+                if self.request.retries == 0:
+                    self.retry(countdown=2, throw=False)
+                    return "first"
+                return "retried"
+
+            celery_worker.reload()
+
+            task = retrying_task.apply_async(args=[1, 2, 3])
+            wait_for(lambda: len(finished_runs) == 1)
+
+            lock = retrying_task.generate_lock(retrying_task.name, task_args=[1, 2, 3])
+            assert retrying_task.get_existing_task_id(lock) == task.id
+
+            task.revoke()
+            wait_for(lambda: retrying_task.get_existing_task_id(lock) is None)
+            assert len(finished_runs) == 1
 
     def test__retry__eager__task_runs_again_and_lock_released(self, scoped_app):
         with scoped_app as app:
@@ -330,6 +414,69 @@ class TestSimpleTask:
             mock_base.assert_called_once()
             assert mock_base.call_args.kwargs["task_id"] == "original_task_id"
             assert simple_task.get_existing_task_id(lock) == "original_task_id"
+
+    @mock.patch.object(BaseTask, "apply_async")
+    def test__requeue_twice_from_running_task__queued_once(
+        self, mock_base, scoped_app
+    ):
+        with scoped_app as app:
+
+            @app.task(base=Singleton, raise_on_duplicate=True)
+            def simple_task(*args):
+                return args
+
+            task_args = [1, 2, 3]
+            lock = simple_task.generate_lock(simple_task.name, task_args=task_args)
+            simple_task.aquire_lock(lock, "original_task_id")
+
+            simple_task.push_request(id="original_task_id", args=task_args)
+            try:
+                simple_task.apply_async(args=task_args, task_id="original_task_id")
+                task = simple_task.apply_async(
+                    args=task_args, task_id="original_task_id"
+                )
+            finally:
+                simple_task.pop_request()
+
+            mock_base.assert_called_once()
+            assert task.id == "original_task_id"
+            assert simple_task.get_existing_task_id(lock) == "original_task_id"
+
+    def test__revoked__lock_owned_by_task__released(self, scoped_app):
+        with scoped_app as app:
+
+            @app.task(base=Singleton)
+            def simple_task(*args):
+                return args
+
+            task_args = [1, 2, 3]
+            lock = simple_task.generate_lock(simple_task.name, task_args=task_args)
+            simple_task.aquire_lock(lock, "revoked_task_id")
+
+            task_revoked.send(
+                sender=simple_task,
+                request=Context(id="revoked_task_id", args=task_args, kwargs={}),
+            )
+
+            assert simple_task.get_existing_task_id(lock) is None
+
+    def test__revoked__lock_owned_by_other_task__kept(self, scoped_app):
+        with scoped_app as app:
+
+            @app.task(base=Singleton)
+            def simple_task(*args):
+                return args
+
+            task_args = [1, 2, 3]
+            lock = simple_task.generate_lock(simple_task.name, task_args=task_args)
+            simple_task.aquire_lock(lock, "other_task_id")
+
+            task_revoked.send(
+                sender=simple_task,
+                request=Context(id="revoked_task_id", args=task_args, kwargs={}),
+            )
+
+            assert simple_task.get_existing_task_id(lock) == "other_task_id"
 
     @mock.patch.object(
         BaseTask, "apply_async", side_effect=Exception("Apply async error")

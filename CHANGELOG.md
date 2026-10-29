@@ -22,6 +22,9 @@ The first release of this fork, published to PyPI as `celery-singleton-reboot`. 
 ### Fixed
 - Calling `self.retry()` from a singleton task no longer treats the retry as a duplicate of itself.
   When the running task re-queues itself under its own task ID, `apply_async()` dispatches it and hands over the lock, which stays held (subject to `lock_expiry`) until the retry finishes.
+  A run re-queues itself at most once, so calling `self.retry()` twice in the same run (e.g. inside `try/except Exception`) queues a single retry.
+- Release the lock when a task is revoked or expires before it runs, which Celery handles without calling `on_success` or `on_failure`.
+  The lock is only released if the discarded task still owns it.
 
 ## [0.3.1] - 2021-01-14
 
