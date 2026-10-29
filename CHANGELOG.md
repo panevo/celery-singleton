@@ -18,6 +18,10 @@ The first release of this fork, published to PyPI as `celery-singleton-reboot`. 
 - Require Python 3.10 or newer, which pytest 9.0.3 needs for its security fix.
 - Publish releases to PyPI with trusted publishing.
 - Build the package with `poetry-core` instead of the whole of Poetry.
+- Require Celery 5.2.2 or newer (5.3 or newer on Python 3.12 and newer, and older than 6) and redis-py 4.5.2 or newer. Before, any Celery from 4 on and any redis-py were allowed, including versions that don't work on Python 3.10 and newer.
+
+### Fixed
+- `celery_singleton.__version__` reported 0.3.1. It now comes from the installed package.
 
 ## [0.3.1] - 2021-01-14
 

@@ -40,6 +40,8 @@ If you're already using a redis backend and a mostly default celery config, you'
 ## Quick start
 `$ pip install celery-singleton-reboot`
 
+It requires Python 3.10 or newer, Celery 5.2.2 or newer (5.3 or newer on Python 3.12 and newer) and redis-py 4.5.2 or newer.
+
 The package is imported as `celery_singleton`, like the original package. If you are switching from `celery-singleton`, uninstall it first, because both packages install the same `celery_singleton` module.
 
 ```python

@@ -1,29 +1,69 @@
-[tool.poetry]
+[build-system]
+requires = ["poetry-core>=2.1"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
 name = "celery-singleton-reboot"
 version = "0.4.0"
 description = "Prevent duplicate celery tasks"
-authors = ["Panevo Services Ltd. <info@panevo.com>", "Steinthor Palsson <steini90@gmail.com>"]
 readme = "README.md"
-homepage = "https://github.com/panevo/celery-singleton"
-repository = "https://github.com/panevo/celery-singleton"
 license = "MIT"
-# The PyPI name differs from the import name
-packages = [{ include = "celery_singleton" }]
+license-files = ["LICENSE"]
+authors = [
+    { name = "Panevo Services Ltd.", email = "info@panevo.com" },
+    { name = "Steinthor Palsson", email = "steini90@gmail.com" },
+]
+# Avoid an upper bound on Python: when a new release is excluded, resolvers
+# silently fall back to old versions of this package instead of failing.
+requires-python = ">=3.10"
+dependencies = [
+    # Celery 5.2.2 fixes CVE-2021-23727, and 5.3 is the first release that
+    # works on Python 3.12
+    "celery>=5.2.2,<6; python_version < '3.12'",
+    "celery>=5.3,<6; python_version >= '3.12'",
+    # The oldest redis-py that Celery's own Redis support accepts. Celery 5.6
+    # doesn't work with redis-py 4.3 and older.
+    "redis>=4.5.2",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: Celery",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 
-[tool.poetry.urls]
+[project.urls]
+Homepage = "https://github.com/panevo/celery-singleton"
 Changelog = "https://github.com/panevo/celery-singleton/blob/master/CHANGELOG.md"
 Issues = "https://github.com/panevo/celery-singleton/issues"
 
-[tool.poetry.dependencies]
-python = "^3.10"
-celery = ">=4"
-redis = "*"
+[dependency-groups]
+test = [
+    "coverage>=7.10",
+    "pytest>=9.0.3",
+]
 
-[tool.poetry.dev-dependencies]
-pytest = "*"
-pytest-cov = "*"
-pytest-celery = "*"
+[tool.poetry]
+# The PyPI name differs from the import name
+packages = [{ include = "celery_singleton" }]
 
-[build-system]
-requires = ["poetry-core>=2.0"]
-build-backend = "poetry.core.masonry.api"
+[tool.pytest.ini_options]
+# The celery_app and celery_worker fixtures
+addopts = ["-p", "celery.contrib.pytest"]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source_pkgs = ["celery_singleton"]
+
+[tool.coverage.report]
+show_missing = true
