@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.4.0] - Unreleased
+## [0.4.0] - 2026-11-09
 
 The first release of this fork, published to PyPI as `celery-singleton-reboot`. The import name is still `celery_singleton`.
 
