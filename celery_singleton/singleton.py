@@ -1,4 +1,5 @@
 from celery import Task as BaseTask
+from celery.signals import task_revoked
 from kombu.utils.uuid import uuid
 import inspect
 
@@ -95,6 +96,13 @@ class Singleton(BaseTask):
         task_id = task_id or uuid()
         lock = self.generate_lock(self.name, args, kwargs)
 
+        if getattr(self.request, "singleton_requeued", False) and self._is_requeue(
+            lock, task_id
+        ):
+            # This run already re-queued itself (e.g. a second self.retry()).
+            # A second copy would run unlocked once the first one releases it
+            return self.AsyncResult(task_id)
+
         run_args = dict(
             lock=lock,
             args=args,
@@ -117,19 +125,36 @@ class Singleton(BaseTask):
             if task:
                 return task
             existing_task_id = self.get_existing_task_id(lock)
+        if existing_task_id == task_id == self.request.id:
+            # The running task is re-queuing itself (e.g. self.retry()) and
+            # already holds the lock, so it is not a duplicate
+            return self.run_locked(**run_args)
         return self.on_duplicate(existing_task_id)
 
     def lock_and_run(self, lock, *args, task_id=None, **kwargs):
         lock_aquired = self.aquire_lock(lock, task_id)
         if lock_aquired:
-            try:
-                return super(Singleton, self).apply_async(
-                    *args, task_id=task_id, **kwargs
-                )
-            except Exception:
-                # Clear the lock if apply_async fails
-                self.unlock(lock)
-                raise
+            return self.run_locked(lock, *args, task_id=task_id, **kwargs)
+
+    def run_locked(self, lock, *args, task_id=None, **kwargs):
+        try:
+            task = super(Singleton, self).apply_async(
+                *args, task_id=task_id, **kwargs
+            )
+        except Exception:
+            # Clear the lock if apply_async fails
+            self.unlock(lock)
+            raise
+        if self._is_requeue(lock, task_id):
+            # The running task re-queued itself under its own lock, so the
+            # lock now belongs to the new message and must outlive this run
+            self.request.singleton_requeued = True
+        return task
+
+    def _is_requeue(self, lock, task_id):
+        return task_id == self.request.id and lock == self.generate_lock(
+            self.name, self.request.args, self.request.kwargs
+        )
 
     def release_lock(self, task_args=None, task_kwargs=None):
         lock = self.generate_lock(self.name, task_args, task_kwargs)
@@ -147,7 +172,23 @@ class Singleton(BaseTask):
         return self.AsyncResult(existing_task_id)
 
     def on_failure(self, exc, task_id, args, kwargs, einfo):
-        self.release_lock(task_args=args, task_kwargs=kwargs)
+        if not getattr(self.request, "singleton_requeued", False):
+            self.release_lock(task_args=args, task_kwargs=kwargs)
 
     def on_success(self, retval, task_id, args, kwargs):
-        self.release_lock(task_args=args, task_kwargs=kwargs)
+        if not getattr(self.request, "singleton_requeued", False):
+            self.release_lock(task_args=args, task_kwargs=kwargs)
+
+    def on_revoked(self, request):
+        # Revoked and expired messages are discarded without calling
+        # on_success or on_failure, so release the lock here. Only release it
+        # if this task still owns it, as it may have expired and been taken
+        lock = self.generate_lock(self.name, request.args, request.kwargs)
+        if self.get_existing_task_id(lock) == request.id:
+            self.unlock(lock)
+
+
+@task_revoked.connect
+def _release_revoked_lock(sender=None, request=None, **kwargs):
+    if isinstance(sender, Singleton):
+        sender.on_revoked(request)
