@@ -20,7 +20,7 @@ dependencies = [
     # Celery 5.2.2 fixes CVE-2021-23727, and 5.3 is the first release that
     # works on Python 3.12
     "celery>=5.2.2,<6; python_version < '3.12'",
-    "celery>=5.3,<6; python_version >= '3.12'",
+    "celery>=5.7.0,<6; python_version >= '3.12'",
     # The oldest redis-py that Celery's own Redis support accepts. Celery 5.6
     # doesn't work with redis-py 4.3 and older.
     "redis>=4.5.2",
